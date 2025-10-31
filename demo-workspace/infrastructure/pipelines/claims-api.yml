@@ -1,0 +1,335 @@
+# Claims API - CI/CD Pipeline (Reference Implementation)
+# This pipeline demonstrates all quality gates and best practices
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+      - feature/*
+  paths:
+    include:
+      - src/claims-api/**
+      - infrastructure/pipelines/claims-api.yml
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  buildConfiguration: 'Release'
+  nodeVersion: '18.x'
+  dotnetVersion: '8.x'
+
+stages:
+  - stage: Build
+    displayName: 'Build and Quality Checks'
+    jobs:
+      - job: CodeQuality
+        displayName: 'Code Quality Checks'
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(nodeVersion)
+            displayName: 'Install Node.js'
+
+          - script: |
+              npm ci
+            displayName: 'Install Dependencies'
+            workingDirectory: src/claims-api
+
+          - script: |
+              npm run lint
+            displayName: 'Run Linter (ESLint)'
+            workingDirectory: src/claims-api
+            continueOnError: false
+
+          - script: |
+              npm run format:check
+            displayName: 'Check Code Formatting (Prettier)'
+            workingDirectory: src/claims-api
+            continueOnError: false
+
+      - job: SecurityScan
+        displayName: 'Security Scanning'
+        dependsOn: CodeQuality
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(nodeVersion)
+            displayName: 'Install Node.js'
+
+          - script: |
+              npm ci
+            displayName: 'Install Dependencies'
+            workingDirectory: src/claims-api
+
+          - script: |
+              npm audit --audit-level=moderate
+            displayName: 'NPM Audit - Dependency Vulnerabilities'
+            workingDirectory: src/claims-api
+            continueOnError: false
+
+          - task: SonarCloudPrepare@1
+            inputs:
+              SonarCloud: 'SonarCloud Connection'
+              organization: 'accumed'
+              scannerMode: 'CLI'
+              configMode: 'manual'
+              cliProjectKey: 'accumed-claims-api'
+              cliProjectName: 'Claims API'
+            displayName: 'Prepare SonarCloud Analysis'
+
+          - task: SonarCloudAnalyze@1
+            displayName: 'Run SonarCloud Code Analysis'
+
+          - task: SonarCloudPublish@1
+            inputs:
+              pollingTimeoutSec: '300'
+            displayName: 'Publish SonarCloud Results'
+
+          - script: |
+              npx snyk test --severity-threshold=high
+            displayName: 'Snyk Security Scan'
+            workingDirectory: src/claims-api
+            env:
+              SNYK_TOKEN: $(SNYK_TOKEN)
+            continueOnError: false
+
+      - job: UnitTests
+        displayName: 'Unit Tests'
+        dependsOn: CodeQuality
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(nodeVersion)
+            displayName: 'Install Node.js'
+
+          - script: |
+              npm ci
+            displayName: 'Install Dependencies'
+            workingDirectory: src/claims-api
+
+          - script: |
+              npm run test:unit -- --coverage --ci --reporters=default --reporters=jest-junit
+            displayName: 'Run Unit Tests with Coverage'
+            workingDirectory: src/claims-api
+
+          - task: PublishTestResults@2
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '**/junit.xml'
+              searchFolder: 'src/claims-api'
+              mergeTestResults: true
+              failTaskOnFailedTests: true
+              testRunTitle: 'Claims API Unit Tests'
+            displayName: 'Publish Unit Test Results'
+
+          - task: PublishCodeCoverageResults@1
+            inputs:
+              codeCoverageTool: 'Cobertura'
+              summaryFileLocation: 'src/claims-api/coverage/cobertura-coverage.xml'
+              reportDirectory: 'src/claims-api/coverage'
+              failIfCoverageEmpty: true
+            displayName: 'Publish Code Coverage'
+
+      - job: IntegrationTests
+        displayName: 'Integration Tests'
+        dependsOn: UnitTests
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(nodeVersion)
+            displayName: 'Install Node.js'
+
+          - script: |
+              npm ci
+            displayName: 'Install Dependencies'
+            workingDirectory: src/claims-api
+
+          - script: |
+              docker-compose -f docker-compose.test.yml up -d
+            displayName: 'Start Test Dependencies (Database, Redis)'
+            workingDirectory: src/claims-api
+
+          - script: |
+              npm run test:integration -- --ci --reporters=default --reporters=jest-junit
+            displayName: 'Run Integration Tests'
+            workingDirectory: src/claims-api
+            env:
+              DATABASE_URL: 'postgresql://test:test@localhost:5432/claims_test'
+              REDIS_URL: 'redis://localhost:6379'
+
+          - task: PublishTestResults@2
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '**/junit.xml'
+              searchFolder: 'src/claims-api'
+              mergeTestResults: true
+              failTaskOnFailedTests: true
+              testRunTitle: 'Claims API Integration Tests'
+            displayName: 'Publish Integration Test Results'
+
+          - script: |
+              docker-compose -f docker-compose.test.yml down -v
+            displayName: 'Cleanup Test Dependencies'
+            workingDirectory: src/claims-api
+            condition: always()
+
+      - job: BuildArtifact
+        displayName: 'Build Application'
+        dependsOn:
+          - SecurityScan
+          - IntegrationTests
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(nodeVersion)
+            displayName: 'Install Node.js'
+
+          - script: |
+              npm ci --production
+            displayName: 'Install Production Dependencies'
+            workingDirectory: src/claims-api
+
+          - script: |
+              npm run build
+            displayName: 'Build Application'
+            workingDirectory: src/claims-api
+
+          - task: Docker@2
+            inputs:
+              command: 'build'
+              repository: 'accumed/claims-api'
+              dockerfile: 'src/claims-api/Dockerfile'
+              tags: |
+                $(Build.BuildId)
+                latest
+            displayName: 'Build Docker Image'
+
+          - task: Docker@2
+            inputs:
+              command: 'push'
+              repository: 'accumed/claims-api'
+              containerRegistry: 'ACR Connection'
+              tags: |
+                $(Build.BuildId)
+                latest
+            displayName: 'Push Docker Image to ACR'
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              PathtoPublish: 'src/claims-api/dist'
+              ArtifactName: 'claims-api-build'
+              publishLocation: 'Container'
+            displayName: 'Publish Build Artifacts'
+
+  - stage: DeployDev
+    displayName: 'Deploy to Development'
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'))
+    jobs:
+      - deployment: DeployToDev
+        displayName: 'Deploy to Dev Environment'
+        environment: 'development'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureWebAppContainer@1
+                  inputs:
+                    azureSubscription: 'Azure Connection'
+                    appName: 'accumed-claims-api-dev'
+                    containers: 'accumed/claims-api:$(Build.BuildId)'
+                  displayName: 'Deploy to Azure App Service (Dev)'
+
+                - script: |
+                    npm run migrate:dev
+                  displayName: 'Run Database Migrations'
+                  env:
+                    DATABASE_URL: $(DEV_DATABASE_URL)
+
+                - script: |
+                    npm run test:smoke -- --env=dev
+                  displayName: 'Run Smoke Tests'
+                  continueOnError: false
+
+  - stage: DeployStaging
+    displayName: 'Deploy to Staging'
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployToStaging
+        displayName: 'Deploy to Staging Environment'
+        environment: 'staging'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureWebAppContainer@1
+                  inputs:
+                    azureSubscription: 'Azure Connection'
+                    appName: 'accumed-claims-api-staging'
+                    containers: 'accumed/claims-api:$(Build.BuildId)'
+                  displayName: 'Deploy to Azure App Service (Staging)'
+
+                - script: |
+                    npm run migrate:staging
+                  displayName: 'Run Database Migrations'
+                  env:
+                    DATABASE_URL: $(STAGING_DATABASE_URL)
+
+                - script: |
+                    npm run test:e2e -- --env=staging
+                  displayName: 'Run E2E Tests'
+                  continueOnError: false
+
+                - script: |
+                    npm run test:performance -- --env=staging
+                  displayName: 'Run Performance Tests'
+                  continueOnError: true
+
+  - stage: DeployProduction
+    displayName: 'Deploy to Production'
+    dependsOn: DeployStaging
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployToProduction
+        displayName: 'Deploy to Production Environment'
+        environment: 'production'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureWebAppContainer@1
+                  inputs:
+                    azureSubscription: 'Azure Connection'
+                    appName: 'accumed-claims-api-prod'
+                    containers: 'accumed/claims-api:$(Build.BuildId)'
+                    deploymentMethod: 'auto'
+                  displayName: 'Deploy to Azure App Service (Production)'
+
+                - script: |
+                    npm run migrate:prod
+                  displayName: 'Run Database Migrations'
+                  env:
+                    DATABASE_URL: $(PROD_DATABASE_URL)
+
+                - script: |
+                    npm run test:smoke -- --env=prod
+                  displayName: 'Run Smoke Tests'
+                  continueOnError: false
+
+                - task: InvokeRESTAPI@1
+                  inputs:
+                    connectionType: 'connectedServiceName'
+                    serviceConnection: 'Monitoring Service'
+                    method: 'POST'
+                    urlSuffix: '/deployments'
+                    body: |
+                      {
+                        "service": "claims-api",
+                        "version": "$(Build.BuildId)",
+                        "environment": "production",
+                        "timestamp": "$(Build.FinishTime)"
+                      }
+                  displayName: 'Record Deployment in Monitoring'

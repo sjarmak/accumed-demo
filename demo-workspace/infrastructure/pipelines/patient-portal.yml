@@ -1,0 +1,100 @@
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  buildConfiguration: 'Release'
+  projectPath: 'src/PatientPortal'
+
+stages:
+  - stage: Build
+    displayName: 'Build Stage'
+    jobs:
+      - job: CodeQuality
+        displayName: 'Code Quality Checks'
+        steps:
+          - task: UseDotNet@2
+            displayName: 'Use .NET SDK'
+            inputs:
+              version: '8.x'
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Restore dependencies'
+            inputs:
+              command: 'restore'
+              projects: '$(projectPath)/*.csproj'
+
+          - script: |
+              dotnet format --verify-no-changes --verbosity diagnostic
+            displayName: 'Run Linter (dotnet format)'
+            workingDirectory: $(projectPath)
+            continueOnError: false
+
+      - job: BuildJob
+        displayName: 'Build Patient Portal'
+        dependsOn: CodeQuality
+        steps:
+          - task: UseDotNet@2
+            displayName: 'Use .NET SDK'
+            inputs:
+              version: '8.x'
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Restore dependencies'
+            inputs:
+              command: 'restore'
+              projects: '$(projectPath)/*.csproj'
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Build application'
+            inputs:
+              command: 'build'
+              projects: '$(projectPath)/*.csproj'
+              arguments: '--configuration $(buildConfiguration) --no-restore'
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Publish application'
+            inputs:
+              command: 'publish'
+              projects: '$(projectPath)/*.csproj'
+              arguments: '--configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)'
+              publishWebProjects: false
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish artifacts'
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+              ArtifactName: 'patient-portal'
+
+  - stage: Deploy
+    displayName: 'Deploy Stage'
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployProduction
+        displayName: 'Deploy to Production'
+        environment: 'production'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadBuildArtifacts@0
+                  displayName: 'Download artifacts'
+                  inputs:
+                    buildType: 'current'
+                    downloadType: 'single'
+                    artifactName: 'patient-portal'
+                    downloadPath: '$(System.ArtifactsDirectory)'
+
+                - task: AzureWebApp@1
+                  displayName: 'Deploy to Azure Web App'
+                  inputs:
+                    azureSubscription: 'Azure-Subscription'
+                    appType: 'webApp'
+                    appName: 'accumed-patient-portal'
+                    package: '$(System.ArtifactsDirectory)/patient-portal/**/*.zip'

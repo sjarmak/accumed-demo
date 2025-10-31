@@ -1,0 +1,151 @@
+# Azure DevOps Pipeline for Medical Coding ML Service
+# Python-based pipeline with testing, linting, Docker build, and deployment
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    include:
+      - services/medical-coding-ml/**
+      - infrastructure/pipelines/medical-coding-ml.yml
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  pythonVersion: '3.11'
+  serviceName: 'medical-coding-ml'
+  dockerRegistry: 'accumedregistry.azurecr.io'
+  imageRepository: 'medical-coding-ml'
+  dockerfilePath: 'services/medical-coding-ml/Dockerfile'
+  tag: '$(Build.BuildId)'
+
+stages:
+  - stage: Build
+    displayName: 'Build and Test'
+    jobs:
+      - job: BuildJob
+        displayName: 'Build, Lint, and Test'
+        steps:
+          - task: UsePythonVersion@0
+            displayName: 'Set Python version'
+            inputs:
+              versionSpec: '$(pythonVersion)'
+              addToPath: true
+
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -r services/medical-coding-ml/requirements.txt
+              pip install -r services/medical-coding-ml/requirements-dev.txt
+            displayName: 'Install dependencies'
+
+          - script: |
+              cd services/medical-coding-ml
+              black --check .
+              flake8 .
+              mypy .
+            displayName: 'Run linting (black, flake8, mypy)'
+            continueOnError: false
+
+          - script: |
+              cd services/medical-coding-ml
+              pytest tests/ --cov=src --cov-report=xml --cov-report=html --junitxml=junit/test-results.xml
+            displayName: 'Run pytest with coverage'
+
+          - task: PublishTestResults@2
+            displayName: 'Publish test results'
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '**/test-results.xml'
+              failTaskOnFailedTests: true
+
+          - task: PublishCodeCoverageResults@1
+            displayName: 'Publish code coverage'
+            inputs:
+              codeCoverageTool: 'Cobertura'
+              summaryFileLocation: 'services/medical-coding-ml/coverage.xml'
+
+  - stage: Docker
+    displayName: 'Docker Build and Push'
+    dependsOn: Build
+    condition: succeeded()
+    jobs:
+      - job: DockerJob
+        displayName: 'Build and Push Docker Image'
+        steps:
+          - task: Docker@2
+            displayName: 'Build Docker image'
+            inputs:
+              command: 'build'
+              repository: '$(imageRepository)'
+              dockerfile: '$(dockerfilePath)'
+              tags: |
+                $(tag)
+                latest
+
+          - task: Docker@2
+            displayName: 'Push Docker image to registry'
+            inputs:
+              command: 'push'
+              repository: '$(imageRepository)'
+              containerRegistry: '$(dockerRegistry)'
+              tags: |
+                $(tag)
+                latest
+
+  - stage: DeployDev
+    displayName: 'Deploy to Development'
+    dependsOn: Docker
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'))
+    jobs:
+      - deployment: DeployDevJob
+        displayName: 'Deploy to Dev Environment'
+        environment: 'dev-medical-coding-ml'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: 'Deploy to Azure Container Apps - Dev'
+                  inputs:
+                    azureSubscription: 'Azure-Dev-Subscription'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      az containerapp update \
+                        --name $(serviceName)-dev \
+                        --resource-group accumed-dev-rg \
+                        --image $(dockerRegistry)/$(imageRepository):$(tag)
+
+  - stage: DeployProd
+    displayName: 'Deploy to Production'
+    dependsOn: Docker
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployProdJob
+        displayName: 'Deploy to Prod Environment'
+        environment: 'prod-medical-coding-ml'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: 'Deploy to Azure Container Apps - Prod'
+                  inputs:
+                    azureSubscription: 'Azure-Prod-Subscription'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      az containerapp update \
+                        --name $(serviceName)-prod \
+                        --resource-group accumed-prod-rg \
+                        --image $(dockerRegistry)/$(imageRepository):$(tag) \
+                        --min-replicas 2 \
+                        --max-replicas 10
+
+                - script: |
+                    echo "Running smoke tests..."
+                    curl -f https://$(serviceName)-prod.accumed.com/health || exit 1
+                  displayName: 'Run smoke tests'
